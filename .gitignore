@@ -1,0 +1,12 @@
+# GoLand
+.idea/
+
+# Nacos temporary files
+tmp/
+
+# Logs
+*.log
+
+# Environment variables
+.env
+*.env
