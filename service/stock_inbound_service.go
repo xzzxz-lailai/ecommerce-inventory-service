@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"errors"
 	"fmt"
 	"math/big"
@@ -17,107 +18,187 @@ import (
 
 var (
 	ErrInvalidStockInbound       = errors.New("入库申请参数错误")
+	ErrStockInboundNotFound      = errors.New("入库单不存在")
+	ErrStockInboundForbidden     = errors.New("无权操作该入库单")
+	ErrStockInboundNotDraft      = errors.New("只有草稿状态的入库单可以添加明细")
+	ErrStockInboundItemsEmpty    = errors.New("入库单至少需要一条SKU明细")
+	ErrStockInboundItemDuplicate = errors.New("该入库单中已经存在此SKU")
 	ErrProductSKUNotFound        = errors.New("SKU不存在")
 	ErrProductServiceUnavailable = errors.New("商品服务暂时不可用")
 )
 
 const inboundNoGenerateAttempts = 5
 
-// CreateStockInbound 创建一张待审核的采购入库单。
-func CreateStockInbound(ctx context.Context, req *model.CreateStockInboundRequest, operatorID int64, authorization string) (*model.CreateStockInboundResponse, error) {
-	// 1.校验基础参数
-	supplierName := strings.TrimSpace(req.SupplierName) // 字符串首尾的空白字符去掉
+// CreateStockInbound 创建一张采购入库单草稿。
+func CreateStockInbound(ctx context.Context, req *model.CreateStockInboundRequest, operatorID int64) (*model.CreateStockInboundResponse, error) {
+	// 1.校验供应商名称和运营人员ID。
+	supplierName := strings.TrimSpace(req.SupplierName)
 	if supplierName == "" {
 		return nil, fmt.Errorf("%w：供应商名称不能为空", ErrInvalidStockInbound)
 	}
 	if operatorID <= 0 {
 		return nil, fmt.Errorf("%w：运营人员ID不能为空", ErrInvalidStockInbound)
 	}
-	if len(req.Items) == 0 {
-		return nil, fmt.Errorf("%w：至少提交一条SKU明细", ErrInvalidStockInbound)
-	}
 
-	// 2.遍历所有入库明细
-	// 检查每一条入库明细的数据是否合法
-	// 防止同一次申请中重复提交同一个 SKU
-	seenSKUs := make(map[int64]struct{}, len(req.Items)) //临时SKU清单
-	for _, item := range req.Items {
-		if item.SKUID <= 0 {
-			return nil, fmt.Errorf("%w：SKU ID必须大于0", ErrInvalidStockInbound)
-		}
-		if item.Quantity <= 0 {
-			return nil, fmt.Errorf("%w：入库数量必须大于0", ErrInvalidStockInbound)
-		}
-		if item.CostPrice < 0 {
-			return nil, fmt.Errorf("%w：采购成本不能小于0", ErrInvalidStockInbound)
-		}
-		if _, exists := seenSKUs[item.SKUID]; exists { // 用于检查重复 SKU
-			return nil, fmt.Errorf("%w：SKU %d重复", ErrInvalidStockInbound, item.SKUID)
-		}
-		seenSKUs[item.SKUID] = struct{}{} // 记录当前这个 SKUID 已经出现过了,把这个 SKU ID 记到 seenSKUs 里面，后面用来判断有没有重复
-
-		// 3.调用商品服务——公司内部账号查询 SKU 详情接口 (外部服务调用放在事务前，避免长时间占用数据库连接和事务)
-		// 一次 HTTP 请求只能查询一个 sku_id
-		sku, err := httpclient.GetProductSKU(ctx, item.SKUID, authorization)
-		if err != nil {
-			switch {
-			case errors.Is(err, httpclient.ErrProductSKUNotFound):
-				return nil, fmt.Errorf("%w：%d", ErrProductSKUNotFound, item.SKUID)
-			default:
-				return nil, ErrProductServiceUnavailable
-			}
-		}
-		if sku.SKUID != item.SKUID {
-			return nil, ErrProductServiceUnavailable
-		}
-	}
-	// 4.生成入库单号   同一次申请中的所有 SKU 使用同一个 inbound_no
+	// 2.生成唯一的入库单号。
 	inboundNo, err := generateUniqueInboundNo(ctx)
 	if err != nil {
 		return nil, err
 	}
-	// 5.组装待写入的明细列表
-	inbounds := make([]*model.StockInbound, 0, len(req.Items)) // 创建一个“等待写入数据库的入库明细列表”
-	for _, item := range req.Items {
-		inbounds = append(inbounds, &model.StockInbound{ // 通过 append 添加到 inbounds 列表中
-			InboundNo:    inboundNo,
-			SupplierName: supplierName,
-			SKUID:        item.SKUID,
-			Quantity:     item.Quantity,
-			CostPrice:    item.CostPrice,
-			Status:       model.StockInboundStatusPending,
-			OperatorID:   operatorID,
-			Remark:       req.Remark,
-		})
+
+	// 3.组装草稿并写入入库单主表。
+	inbound := &model.StockInbound{
+		InboundNo:    inboundNo,
+		SupplierName: supplierName,
+		Status:       model.StockInboundStatusDraft,
+		OperatorID:   operatorID,
+		Remark:       req.Remark,
+	}
+	if err := repo.CreateStockInbound(ctx, inbound); err != nil {
+		return nil, err
 	}
 
-	tx, err := global.DB.BeginTxx(ctx, nil) // 开启事务
+	// 4.返回新建草稿的主表信息。
+	return &model.CreateStockInboundResponse{
+		InboundID: inbound.InboundID,
+		InboundNo: inbound.InboundNo,
+		Status:    inbound.Status,
+	}, nil
+}
+
+// CreateStockInboundItem 向一张草稿入库单添加SKU明细
+func CreateStockInboundItem(ctx context.Context, inboundID int64, req *model.CreateStockInboundItemRequest, operatorID int64, authorization string) (*model.CreateStockInboundItemResponse, error) {
+	// 1.校验入库单ID、运营人员ID和明细参数
+	if inboundID <= 0 {
+		return nil, fmt.Errorf("%w：入库单ID必须大于0", ErrInvalidStockInbound)
+	}
+	if operatorID <= 0 {
+		return nil, fmt.Errorf("%w：运营人员ID不能为空", ErrInvalidStockInbound)
+	}
+	if req.SKUID <= 0 {
+		return nil, fmt.Errorf("%w：SKU ID必须大于0", ErrInvalidStockInbound)
+	}
+	if req.Quantity <= 0 {
+		return nil, fmt.Errorf("%w：入库数量必须大于0", ErrInvalidStockInbound)
+	}
+	if req.CostPrice < 0 {
+		return nil, fmt.Errorf("%w：采购成本不能小于0", ErrInvalidStockInbound)
+	}
+
+	// 2.确认入库单存在、属于当前运营人员并且处于草稿状态
+	inbound, err := repo.GetStockInboundByID(ctx, inboundID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrStockInboundNotFound
+		}
+		return nil, err
+	}
+	if inbound.OperatorID != operatorID {
+		return nil, ErrStockInboundForbidden
+	} // 创建入库申请单的运营人员，与向该申请单添加 SKU 明细的运营人员，必须是同一个人
+	if inbound.Status != model.StockInboundStatusDraft {
+		return nil, ErrStockInboundNotDraft
+	}
+
+	// 3.调用商品服务确认SKU存在
+	sku, err := httpclient.GetProductSKU(ctx, req.SKUID, authorization)
+	if err != nil {
+		if errors.Is(err, httpclient.ErrProductSKUNotFound) {
+			return nil, fmt.Errorf("%w：%d", ErrProductSKUNotFound, req.SKUID)
+		}
+		return nil, ErrProductServiceUnavailable
+	}
+	// 商品服务返回的 SKUID和前端填入的skuid是否一致,防止商品服务接口返回错误数据
+	if sku.SKUID != req.SKUID {
+		return nil, ErrProductServiceUnavailable
+	}
+	// 4.写入SKU明细，数据库唯一索引负责最终防重复
+	item := &model.StockInboundItem{
+		InboundID: inboundID,
+		SKUID:     req.SKUID,
+		Quantity:  req.Quantity,
+		CostPrice: req.CostPrice,
+	}
+	if err := repo.CreateStockInboundItem(ctx, item, operatorID); err != nil {
+		switch {
+		case errors.Is(err, repo.ErrDuplicateStockInboundItem):
+			return nil, ErrStockInboundItemDuplicate
+		case errors.Is(err, repo.ErrStockInboundNotEditable):
+			return nil, ErrStockInboundNotDraft
+		default:
+			return nil, err
+		}
+	}
+
+	// 5.返回新增的明细信息。
+	return &model.CreateStockInboundItemResponse{
+		ItemID:    item.ItemID,
+		InboundID: item.InboundID,
+		SKUID:     item.SKUID,
+		Quantity:  item.Quantity,
+		CostPrice: item.CostPrice,
+	}, nil
+}
+
+// SubmitStockInbound 提交草稿入库单，等待管理员审核。
+func SubmitStockInbound(ctx context.Context, inboundID int64, operatorID int64) (*model.SubmitStockInboundResponse, error) {
+	// 1.校验入库单ID和运营人员ID。
+	if inboundID <= 0 {
+		return nil, fmt.Errorf("%w：入库单ID必须大于0", ErrInvalidStockInbound)
+	}
+	if operatorID <= 0 {
+		return nil, fmt.Errorf("%w：运营人员ID不能为空", ErrInvalidStockInbound)
+	}
+
+	// 2.开启事务并锁定入库单，防止提交期间继续修改明细。
+	tx, err := global.DB.BeginTxx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	// 6.把inbounds入库明细信息,写入到数据库stock_inbounds表中
-	if err := repo.CreateStockInbounds(ctx, tx, inbounds); err != nil {
+
+	inbound, err := repo.GetStockInboundByIDForUpdate(ctx, tx, inboundID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrStockInboundNotFound
+		}
+		return nil, err
+	}
+	// 创建入库单和提交审核必须是同一个人,防止不同运营人员修改或提交别人的草稿
+	if inbound.OperatorID != operatorID {
+		return nil, ErrStockInboundForbidden
+	}
+	if inbound.Status != model.StockInboundStatusDraft {
+		return nil, ErrStockInboundNotDraft
+	}
+
+	// 3.入库单至少需要一条SKU明细才能提交。
+	itemCount, err := repo.CountStockInboundItems(ctx, tx, inboundID)
+	if err != nil {
+		return nil, err
+	}
+	if itemCount == 0 {
+		return nil, ErrStockInboundItemsEmpty
+	}
+
+	// 4.将草稿更新为待审核并记录提交时间。
+	submittedAt := time.Now()
+	if err := repo.SubmitStockInbound(ctx, tx, inboundID, submittedAt); err != nil {
+		if errors.Is(err, repo.ErrStockInboundNotEditable) {
+			return nil, ErrStockInboundNotDraft
+		}
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	// 7.封装明细列表，用于返回给前端
-	items := make([]model.CreateStockInboundItemResponse, 0, len(inbounds))
-	for _, inbound := range inbounds {
-		items = append(items, model.CreateStockInboundItemResponse{
-			InboundID: inbound.InboundID,
-			SKUID:     inbound.SKUID,
-			Quantity:  inbound.Quantity,
-			CostPrice: inbound.CostPrice,
-		})
-	}
-	// 8.返回创建结果
-	return &model.CreateStockInboundResponse{
-		InboundNo: inboundNo,
-		Status:    model.StockInboundStatusPending,
-		Items:     items,
+
+	// 5.返回提交结果。
+	return &model.SubmitStockInboundResponse{
+		InboundID:   inbound.InboundID,
+		InboundNo:   inbound.InboundNo,
+		Status:      model.StockInboundStatusPending,
+		SubmittedAt: submittedAt,
 	}, nil
 }
 
@@ -134,8 +215,8 @@ func generateUniqueInboundNo(ctx context.Context) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if !exists {
-			return inboundNo, nil
+		if !exists { // 如果这个入库单号数据库里不存在
+			return inboundNo, nil // 返回生成好的单号
 		}
 	}
 
