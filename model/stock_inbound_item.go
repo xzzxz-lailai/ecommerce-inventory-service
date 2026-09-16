@@ -28,3 +28,15 @@ type CreateStockInboundItemResponse struct {
 	Quantity  int   `json:"quantity"`   // 申请入库数量。
 	CostPrice int64 `json:"cost_price"` // 单件采购成本，单位为分。
 }
+
+// StockInboundDetailItemResponse 入库申请详情中的SKU明细。
+type StockInboundDetailItemResponse struct {
+	ItemID      int64   `json:"item_id"`      // 入库明细ID。
+	SKUID       int64   `json:"sku_id"`       // SKU ID。
+	ProductID   int64   `json:"product_id"`   // 商品ID。
+	ProductName string  `json:"product_name"` // 商品名称。
+	SKUName     string  `json:"sku_name"`     // SKU规格名称。
+	SKUImage    *string `json:"sku_image"`    // SKU规格图片，可以为空。
+	Quantity    int     `json:"quantity"`     // 申请入库数量。
+	CostPrice   int64   `json:"cost_price"`   // 单件采购成本，单位为分。
+}

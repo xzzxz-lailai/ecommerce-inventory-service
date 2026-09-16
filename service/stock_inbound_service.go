@@ -24,10 +24,16 @@ var (
 	ErrStockInboundItemsEmpty    = errors.New("入库单至少需要一条SKU明细")
 	ErrStockInboundItemDuplicate = errors.New("该入库单中已经存在此SKU")
 	ErrProductSKUNotFound        = errors.New("SKU不存在")
+	ErrProductNotFound           = errors.New("商品不存在")
 	ErrProductServiceUnavailable = errors.New("商品服务暂时不可用")
 )
 
-const inboundNoGenerateAttempts = 5
+const (
+	inboundNoGenerateAttempts   = 5
+	defaultStockInboundPage     = 1
+	defaultStockInboundPageSize = 10
+	maxStockInboundPageSize     = 100
+)
 
 // CreateStockInbound 创建一张采购入库单草稿。
 func CreateStockInbound(ctx context.Context, req *model.CreateStockInboundRequest, operatorID int64) (*model.CreateStockInboundResponse, error) {
@@ -108,7 +114,7 @@ func CreateStockInboundItem(ctx context.Context, inboundID int64, req *model.Cre
 		}
 		return nil, ErrProductServiceUnavailable
 	}
-	// 商品服务返回的 SKUID和前端填入的skuid是否一致,防止商品服务接口返回错误数据
+	// 商品服务返回的 SKUID和前端填入的skuid是否一致,商品服务接防止口返回错误数据
 	if sku.SKUID != req.SKUID {
 		return nil, ErrProductServiceUnavailable
 	}
@@ -199,6 +205,120 @@ func SubmitStockInbound(ctx context.Context, inboundID int64, operatorID int64) 
 		InboundNo:   inbound.InboundNo,
 		Status:      model.StockInboundStatusPending,
 		SubmittedAt: submittedAt,
+	}, nil
+}
+
+// ListStockInbounds 查询全部入库申请列表。
+func ListStockInbounds(ctx context.Context, req *model.ListStockInboundsRequest) (*model.ListStockInboundsResponse, error) {
+	// 设置默认分页参数，并限制单页最大数量。
+	page := req.Page
+	if page <= 0 {
+		page = defaultStockInboundPage
+	}
+	pageSize := req.PageSize
+	if pageSize <= 0 {
+		pageSize = defaultStockInboundPageSize
+	}
+	if pageSize > maxStockInboundPageSize {
+		pageSize = maxStockInboundPageSize
+	}
+	offset := (page - 1) * pageSize
+
+	list, err := repo.ListStockInbounds(ctx, req.Status, pageSize, offset)
+	if err != nil {
+		return nil, err
+	}
+	total, err := repo.CountStockInbounds(ctx, req.Status)
+	if err != nil {
+		return nil, err
+	}
+
+	return &model.ListStockInboundsResponse{
+		List:     list,
+		Total:    total,
+		Page:     page,
+		PageSize: pageSize,
+	}, nil
+}
+
+// GetStockInboundDetail 查询入库单主信息、全部SKU明细及商品展示信息。
+func GetStockInboundDetail(ctx context.Context, inboundID int64, authorization string) (*model.StockInboundDetailResponse, error) {
+	if inboundID <= 0 {
+		return nil, fmt.Errorf("%w：入库单ID必须大于0", ErrInvalidStockInbound)
+	}
+
+	// 1.查询入库单主信息和全部SKU明细。
+	inbound, err := repo.GetStockInboundByID(ctx, inboundID) // 根据主键查询入库单信息
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrStockInboundNotFound
+		}
+		return nil, err
+	}
+	items, err := repo.ListStockInboundItems(ctx, inboundID) // 查询一张入库单下的全部SKU明细
+	if err != nil {
+		return nil, err
+	}
+
+	// 2.调用商品服务补充SKU信息和商品名称。
+	detailItems := make([]model.StockInboundDetailItemResponse, 0, len(items)) // 准备返回给前端的明细列表。
+	productNames := make(map[int64]string)                                     // 缓存已查询的商品名称，临时对照表 避免重复调用商品服务。
+	for _, item := range items {                                               // 逐条处理这张入库单的SKU明细。
+		sku, err := httpclient.GetProductSKU(ctx, item.SKUID, authorization) // 查询当前明细对应的SKU信息。
+		if err != nil {
+			if errors.Is(err, httpclient.ErrProductSKUNotFound) {
+				return nil, fmt.Errorf("%w：%d", ErrProductSKUNotFound, item.SKUID)
+			}
+			return nil, ErrProductServiceUnavailable
+		}
+		if sku.SKUID != item.SKUID {
+			return nil, ErrProductServiceUnavailable
+		} // 返回的SKU ID与明细中的SKU ID不一致时，不继续组装详情。 商品服务接防止口返回错误数据
+
+		productName, exists := productNames[sku.ProductID] // 用这个 SKU 所属的商品 ID，看看临时对照表里有没有对应的商品名称
+		if !exists {                                       // exists == false 说明临时对照表里还没有这个商品名称，于是调用接口httpclient.GetProductDetail
+			product, err := httpclient.GetProductDetail(ctx, sku.ProductID, authorization) // 查询SKU所属商品的详情。
+			if err != nil {
+				if errors.Is(err, httpclient.ErrProductNotFound) {
+					return nil, fmt.Errorf("%w：%d", ErrProductNotFound, sku.ProductID)
+				}
+				return nil, ErrProductServiceUnavailable
+			}
+			if product.ProductID != sku.ProductID {
+				return nil, ErrProductServiceUnavailable
+			} // 返回的商品ID与SKU所属商品ID不一致时，不继续组装详情。商品服务接防止口返回错误数据
+			productName = product.ProductName         // 商品服务返回的商品名称赋给局部变量 productName
+			productNames[sku.ProductID] = productName // 把商品名称存进临时对照表，供后续 SKU 复
+		}
+
+		detailItems = append(detailItems, model.StockInboundDetailItemResponse{ // 组合库存明细与商品信息，加入返回列表。
+			ItemID:      item.ItemID,
+			SKUID:       item.SKUID,
+			ProductID:   sku.ProductID,
+			ProductName: productName,
+			SKUName:     sku.SKUName,
+			SKUImage:    sku.SKUImage,
+			Quantity:    item.Quantity,
+			CostPrice:   item.CostPrice,
+		})
+	}
+
+	// 3.组合入库单主信息和全部明细。
+	return &model.StockInboundDetailResponse{
+		InboundID:    inbound.InboundID,
+		InboundNo:    inbound.InboundNo,
+		SupplierName: inbound.SupplierName,
+		Status:       inbound.Status,
+		OperatorID:   inbound.OperatorID,
+		ReviewerID:   inbound.ReviewerID,
+		SubmittedAt:  inbound.SubmittedAt,
+		ReviewedAt:   inbound.ReviewedAt,
+		InboundAt:    inbound.InboundAt,
+		Remark:       inbound.Remark,
+		ReviewRemark: inbound.ReviewRemark,
+		CreatedAt:    inbound.CreatedAt,
+		UpdatedAt:    inbound.UpdatedAt,
+		Items:        detailItems,
 	}, nil
 }
 

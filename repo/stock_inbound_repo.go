@@ -83,6 +83,7 @@ func GetStockInboundByID(ctx context.Context, inboundID int64) (*model.StockInbo
 
 // CreateStockInboundItem 向当前运营人员的草稿入库单添加SKU明细。
 func CreateStockInboundItem(ctx context.Context, item *model.StockInboundItem, operatorID int64) error {
+	// 查询符合条件的入库单，将查询到的 inbound_id 和传入的 SKU 明细写入明细表
 	result, err := global.DB.ExecContext(
 		ctx,
 		`INSERT INTO stock_inbound_items (inbound_id, sku_id, quantity, cost_price)
@@ -185,4 +186,65 @@ func SubmitStockInbound(ctx context.Context, tx *sqlx.Tx, inboundID int64, submi
 	}
 
 	return nil
+}
+
+// ListStockInbounds 查询全部入库申请列表，可按状态筛选。
+func ListStockInbounds(ctx context.Context, status *int8, limit int, offset int) ([]model.StockInboundListItem, error) {
+	list := make([]model.StockInboundListItem, 0)
+	query := `SELECT inbound_id, inbound_no, status, remark, created_at, operator_id
+		FROM stock_inbounds
+		ORDER BY created_at DESC, inbound_id DESC
+		LIMIT ? OFFSET ?`
+	args := []interface{}{limit, offset}
+
+	if status != nil {
+		query = `SELECT inbound_id, inbound_no, status, remark, created_at, operator_id
+			FROM stock_inbounds
+			WHERE status = ?
+			ORDER BY created_at DESC, inbound_id DESC
+			LIMIT ? OFFSET ?`
+		args = []interface{}{*status, limit, offset}
+	}
+
+	if err := global.DB.SelectContext(ctx, &list, query, args...); err != nil {
+		return nil, err
+	}
+
+	return list, nil
+}
+
+// CountStockInbounds 查询符合条件的全部入库申请总数。
+func CountStockInbounds(ctx context.Context, status *int8) (int64, error) {
+	var total int64
+	query := `SELECT COUNT(*) FROM stock_inbounds`
+	args := make([]interface{}, 0)
+
+	if status != nil {
+		query = `SELECT COUNT(*) FROM stock_inbounds WHERE status = ?`
+		args = []interface{}{*status}
+	}
+
+	if err := global.DB.GetContext(ctx, &total, query, args...); err != nil {
+		return 0, err
+	}
+
+	return total, nil
+}
+
+// ListStockInboundItems 查询一张入库单下的全部SKU明细。
+func ListStockInboundItems(ctx context.Context, inboundID int64) ([]model.StockInboundItem, error) {
+	items := make([]model.StockInboundItem, 0)
+	if err := global.DB.SelectContext(
+		ctx,
+		&items,
+		`SELECT item_id, inbound_id, sku_id, quantity, cost_price, created_at, updated_at
+		FROM stock_inbound_items
+		WHERE inbound_id = ?
+		ORDER BY item_id ASC`,
+		inboundID,
+	); err != nil {
+		return nil, err
+	}
+
+	return items, nil
 }

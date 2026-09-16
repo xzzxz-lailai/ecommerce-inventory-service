@@ -47,3 +47,46 @@ type SubmitStockInboundResponse struct {
 	Status      int8      `json:"status"`       // 状态：1待审核。
 	SubmittedAt time.Time `json:"submitted_at"` // 提交审核时间。
 }
+
+// ListStockInboundsRequest 入库申请列表查询条件。
+type ListStockInboundsRequest struct {
+	Status   *int8 // 状态筛选，为空时查询全部状态。
+	Page     int   // 页码。
+	PageSize int   // 每页数量。
+}
+
+// StockInboundListItem 入库申请列表项。
+type StockInboundListItem struct {
+	InboundID  int64     `json:"inbound_id" db:"inbound_id"`   // 入库单ID。
+	InboundNo  string    `json:"inbound_no" db:"inbound_no"`   // 入库单号。
+	Status     int8      `json:"status" db:"status"`           // 入库单状态。
+	Remark     *string   `json:"remark" db:"remark"`           // 入库说明。
+	CreatedAt  time.Time `json:"created_at" db:"created_at"`   // 创建时间。
+	OperatorID int64     `json:"operator_id" db:"operator_id"` // 创建入库单的运营人员ID。
+}
+
+// ListStockInboundsResponse 入库申请分页列表响应。
+type ListStockInboundsResponse struct {
+	List     []StockInboundListItem `json:"list"`      // 当前页的入库申请。
+	Total    int64                  `json:"total"`     // 符合条件的总记录数。
+	Page     int                    `json:"page"`      // 当前页码。
+	PageSize int                    `json:"page_size"` // 每页数量。
+}
+
+// StockInboundDetailResponse 入库申请详情响应。
+type StockInboundDetailResponse struct {
+	InboundID    int64                            `json:"inbound_id"`    // 入库单ID。
+	InboundNo    string                           `json:"inbound_no"`    // 入库单号。
+	SupplierName string                           `json:"supplier_name"` // 供应商名称。
+	Status       int8                             `json:"status"`        // 入库单状态。
+	OperatorID   int64                            `json:"operator_id"`   // 创建入库单的运营人员ID。
+	ReviewerID   *int64                           `json:"reviewer_id"`   // 审核人ID。
+	SubmittedAt  *time.Time                       `json:"submitted_at"`  // 提交审核时间。
+	ReviewedAt   *time.Time                       `json:"reviewed_at"`   // 完成审核时间。
+	InboundAt    *time.Time                       `json:"inbound_at"`    // 实际增加库存时间。
+	Remark       *string                          `json:"remark"`        // 入库说明。
+	ReviewRemark *string                          `json:"review_remark"` // 审核说明或拒绝原因。
+	CreatedAt    time.Time                        `json:"created_at"`    // 创建时间。
+	UpdatedAt    time.Time                        `json:"updated_at"`    // 最后修改时间。
+	Items        []StockInboundDetailItemResponse `json:"items"`         // 该入库单的全部SKU明细。
+}
