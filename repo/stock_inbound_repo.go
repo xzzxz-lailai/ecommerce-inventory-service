@@ -17,6 +17,10 @@ var (
 	ErrDuplicateStockInboundItem = errors.New("入库单中已存在该SKU")
 	// ErrStockInboundNotEditable 表示入库单不存在、无权操作或不是草稿状态。
 	ErrStockInboundNotEditable = errors.New("入库单当前不可编辑")
+	// ErrStockInboundItemUpdateFailed 表示已确认明细存在，但更新没有影响任何行。
+	ErrStockInboundItemUpdateFailed = errors.New("入库明细更新异常")
+	// ErrStockInboundItemDeleteFailed 表示已确认明细存在，但删除没有影响任何行。
+	ErrStockInboundItemDeleteFailed = errors.New("入库明细删除异常")
 )
 
 // ExistsStockInboundNo 判断入库单号是否已经存在。
@@ -68,7 +72,7 @@ func GetStockInboundByID(ctx context.Context, inboundID int64) (*model.StockInbo
 		&inbound,
 		`SELECT
 			inbound_id, inbound_no, supplier_name, status, operator_id,
-			reviewer_id, submitted_at, reviewed_at, inbound_at,
+			reviewer_id, submitted_at, reviewed_at,
 			remark, review_remark, created_at, updated_at
 		FROM stock_inbounds
 		WHERE inbound_id = ?`,
@@ -123,6 +127,66 @@ func CreateStockInboundItem(ctx context.Context, item *model.StockInboundItem, o
 	return nil
 }
 
+// GetStockInboundItemByIDForUpdate 在事务中查询并锁定指定入库单下的一条明细。
+func GetStockInboundItemByIDForUpdate(ctx context.Context, tx *sqlx.Tx, inboundID int64, itemID int64) (*model.StockInboundItem, error) {
+	var item model.StockInboundItem
+	err := tx.GetContext(
+		ctx,
+		&item,
+		`SELECT item_id, inbound_id, sku_id, quantity, cost_price, created_at, updated_at
+		FROM stock_inbound_items
+		WHERE inbound_id = ? AND item_id = ?
+		FOR UPDATE`,
+		inboundID, itemID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
+// UpdateStockInboundItem 更新一条草稿SKU明细的数量和成本价。
+func UpdateStockInboundItem(ctx context.Context, tx *sqlx.Tx, inboundID int64, itemID int64, quantity int, costPrice int64) error {
+	result, err := tx.ExecContext(
+		ctx,
+		`UPDATE stock_inbound_items
+		SET quantity = ?, cost_price = ?
+		WHERE inbound_id = ? AND item_id = ?`,
+		quantity, costPrice, inboundID, itemID,
+	)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return ErrStockInboundItemUpdateFailed
+	}
+	return nil
+}
+
+// DeleteStockInboundItem 删除指定入库单中的一条SKU明细。
+func DeleteStockInboundItem(ctx context.Context, tx *sqlx.Tx, inboundID int64, itemID int64) error {
+	result, err := tx.ExecContext(
+		ctx,
+		"DELETE FROM stock_inbound_items WHERE inbound_id = ? AND item_id = ?",
+		inboundID, itemID,
+	)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return ErrStockInboundItemDeleteFailed
+	}
+	return nil
+}
+
 // GetStockInboundByIDForUpdate 在事务中查询并锁定入库单。
 func GetStockInboundByIDForUpdate(ctx context.Context, tx *sqlx.Tx, inboundID int64) (*model.StockInbound, error) {
 	var inbound model.StockInbound
@@ -131,7 +195,7 @@ func GetStockInboundByIDForUpdate(ctx context.Context, tx *sqlx.Tx, inboundID in
 		&inbound,
 		`SELECT
 			inbound_id, inbound_no, supplier_name, status, operator_id,
-			reviewer_id, submitted_at, reviewed_at, inbound_at,
+			reviewer_id, submitted_at, reviewed_at,
 			remark, review_remark, created_at, updated_at
 		FROM stock_inbounds
 		WHERE inbound_id = ?
@@ -185,6 +249,30 @@ func SubmitStockInbound(ctx context.Context, tx *sqlx.Tx, inboundID int64, submi
 		return ErrStockInboundNotEditable
 	}
 
+	return nil
+}
+
+// CancelStockInbound 将创建人的草稿或待审核入库单标记为已取消。
+func CancelStockInbound(ctx context.Context, tx *sqlx.Tx, inboundID int64, operatorID int64) error {
+	result, err := tx.ExecContext(
+		ctx,
+		`UPDATE stock_inbounds
+		SET status = ?
+		WHERE inbound_id = ? AND operator_id = ? AND status IN (?, ?)`,
+		model.StockInboundStatusCancelled,
+		inboundID, operatorID,
+		model.StockInboundStatusDraft, model.StockInboundStatusPending,
+	)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return ErrStockInboundNotEditable
+	}
 	return nil
 }
 
@@ -247,4 +335,91 @@ func ListStockInboundItems(ctx context.Context, inboundID int64) ([]model.StockI
 	}
 
 	return items, nil
+}
+
+// ListStockInboundItemsTx 在审核事务中读取整张入库单的明细。
+func ListStockInboundItemsTx(ctx context.Context, tx *sqlx.Tx, inboundID int64) ([]model.StockInboundItem, error) {
+	items := make([]model.StockInboundItem, 0)
+	if err := tx.SelectContext(
+		ctx,
+		&items,
+		`SELECT item_id, inbound_id, sku_id, quantity, cost_price, created_at, updated_at
+		FROM stock_inbound_items
+		WHERE inbound_id = ?
+		ORDER BY sku_id ASC`,
+		inboundID,
+	); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+// IncreaseSKUAvailableStock 新建库存记录或原子增加已有SKU的可用库存。
+func IncreaseSKUAvailableStock(ctx context.Context, tx *sqlx.Tx, skuID int64, quantity int) error {
+	_, err := tx.ExecContext(
+		ctx,
+		`INSERT INTO sku_stocks (sku_id, available_stock, locked_stock)
+		VALUES (?, ?, 0)
+		ON DUPLICATE KEY UPDATE available_stock = available_stock + ?`,
+		skuID, quantity, quantity,
+	)
+	return err
+}
+
+// CreateStockInboundLog 写入一条SKU审核入库流水。
+func CreateStockInboundLog(ctx context.Context, tx *sqlx.Tx, inboundNo string, skuID int64, quantity int, reviewerID int64) error {
+	_, err := tx.ExecContext(
+		ctx,
+		`INSERT INTO stock_logs (
+			sku_id, business_type, business_no, available_change, locked_change, operator_id
+		) VALUES (?, ?, ?, ?, 0, ?)`,
+		skuID, model.StockBusinessTypeInbound, inboundNo, quantity, reviewerID,
+	)
+	return err
+}
+
+// ApproveStockInbound 将待审核入库单标记为已入库。
+func ApproveStockInbound(ctx context.Context, tx *sqlx.Tx, inboundID int64, reviewerID int64, reviewedAt time.Time) error {
+	result, err := tx.ExecContext(
+		ctx,
+		`UPDATE stock_inbounds
+		SET status = ?, reviewer_id = ?, reviewed_at = ?
+		WHERE inbound_id = ? AND status = ?`,
+		model.StockInboundStatusCompleted, reviewerID, reviewedAt,
+		inboundID, model.StockInboundStatusPending,
+	)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return ErrStockInboundNotEditable
+	}
+	return nil
+}
+
+// RejectStockInbound 将待审核入库单标记为已拒绝并保存拒绝原因。
+func RejectStockInbound(ctx context.Context, tx *sqlx.Tx, inboundID int64, reviewerID int64, reviewedAt time.Time, reviewRemark string) error {
+	result, err := tx.ExecContext(
+		ctx,
+		`UPDATE stock_inbounds
+		SET status = ?, reviewer_id = ?, reviewed_at = ?, review_remark = ?
+		WHERE inbound_id = ? AND status = ?`,
+		model.StockInboundStatusRejected, reviewerID, reviewedAt, reviewRemark,
+		inboundID, model.StockInboundStatusPending,
+	)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return ErrStockInboundNotEditable
+	}
+	return nil
 }

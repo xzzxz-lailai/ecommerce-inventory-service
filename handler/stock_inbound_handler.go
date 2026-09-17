@@ -76,6 +76,82 @@ func CreateStockInboundItem(c *gin.Context) {
 	pkg.Success(c, "入库明细添加成功", resp)
 }
 
+// UpdateStockInboundItem 修改草稿入库单中一条SKU明细的数量和成本价。
+func UpdateStockInboundItem(c *gin.Context) {
+	inboundID, err := strconv.ParseInt(c.Param("inbound_id"), 10, 64)
+	if err != nil || inboundID <= 0 {
+		pkg.Error(c, http.StatusBadRequest, "入库单ID错误")
+		return
+	}
+	itemID, err := strconv.ParseInt(c.Param("item_id"), 10, 64)
+	if err != nil || itemID <= 0 {
+		pkg.Error(c, http.StatusBadRequest, "入库明细ID错误")
+		return
+	}
+
+	var req model.UpdateStockInboundItemRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		pkg.Error(c, http.StatusBadRequest, "参数错误")
+		return
+	}
+
+	resp, changed, err := service.UpdateStockInboundItem(c.Request.Context(), inboundID, itemID, &req, c.GetInt64("userID"))
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidStockInbound):
+			pkg.Error(c, http.StatusBadRequest, err.Error())
+		case errors.Is(err, service.ErrStockInboundNotFound), errors.Is(err, service.ErrStockInboundItemNotFound):
+			pkg.Error(c, http.StatusNotFound, err.Error())
+		case errors.Is(err, service.ErrStockInboundForbidden):
+			pkg.Error(c, http.StatusForbidden, err.Error())
+		case errors.Is(err, service.ErrStockInboundNotDraft):
+			pkg.Error(c, http.StatusConflict, err.Error())
+		default:
+			pkg.Error(c, http.StatusInternalServerError, "入库明细修改失败")
+		}
+		return
+	}
+
+	if !changed { // 新旧值相同，本次未修改数据库，直接返回成功
+		pkg.Success(c, "当前没有需要修改的地方", resp)
+		return
+	}
+	pkg.Success(c, "入库明细修改成功", resp)
+}
+
+// DeleteStockInboundItem 删除草稿入库单中的一条SKU明细。
+func DeleteStockInboundItem(c *gin.Context) {
+	inboundID, err := strconv.ParseInt(c.Param("inbound_id"), 10, 64)
+	if err != nil || inboundID <= 0 {
+		pkg.Error(c, http.StatusBadRequest, "入库单ID错误")
+		return
+	}
+	itemID, err := strconv.ParseInt(c.Param("item_id"), 10, 64)
+	if err != nil || itemID <= 0 {
+		pkg.Error(c, http.StatusBadRequest, "入库明细ID错误")
+		return
+	}
+
+	resp, err := service.DeleteStockInboundItem(c.Request.Context(), inboundID, itemID, c.GetInt64("userID"))
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidStockInbound):
+			pkg.Error(c, http.StatusBadRequest, err.Error())
+		case errors.Is(err, service.ErrStockInboundNotFound), errors.Is(err, service.ErrStockInboundItemNotFound):
+			pkg.Error(c, http.StatusNotFound, err.Error())
+		case errors.Is(err, service.ErrStockInboundForbidden):
+			pkg.Error(c, http.StatusForbidden, err.Error())
+		case errors.Is(err, service.ErrStockInboundNotDraft):
+			pkg.Error(c, http.StatusConflict, err.Error())
+		default:
+			pkg.Error(c, http.StatusInternalServerError, "入库明细删除失败")
+		}
+		return
+	}
+
+	pkg.Success(c, "入库明细删除成功", resp)
+}
+
 // SubmitStockInbound 提交采购入库申请，等待管理员审核。
 func SubmitStockInbound(c *gin.Context) {
 	inboundID, err := strconv.ParseInt(c.Param("inbound_id"), 10, 64)
@@ -104,6 +180,92 @@ func SubmitStockInbound(c *gin.Context) {
 	pkg.Success(c, "入库申请提交成功，等待审核", resp)
 }
 
+// CancelStockInbound 运营取消自己创建的草稿或待审核入库单。
+func CancelStockInbound(c *gin.Context) {
+	inboundID, err := strconv.ParseInt(c.Param("inbound_id"), 10, 64)
+	if err != nil || inboundID <= 0 {
+		pkg.Error(c, http.StatusBadRequest, "入库单ID错误")
+		return
+	}
+
+	resp, err := service.CancelStockInbound(c.Request.Context(), inboundID, c.GetInt64("userID"))
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidStockInbound):
+			pkg.Error(c, http.StatusBadRequest, err.Error())
+		case errors.Is(err, service.ErrStockInboundNotFound):
+			pkg.Error(c, http.StatusNotFound, err.Error())
+		case errors.Is(err, service.ErrStockInboundForbidden):
+			pkg.Error(c, http.StatusForbidden, err.Error())
+		case errors.Is(err, service.ErrStockInboundNotCancellable):
+			pkg.Error(c, http.StatusConflict, err.Error())
+		default:
+			pkg.Error(c, http.StatusInternalServerError, "入库单取消失败")
+		}
+		return
+	}
+
+	pkg.Success(c, "入库单取消成功", resp)
+}
+
+// ApproveStockInbound 管理员审核通过入库申请并增加整单库存。
+func ApproveStockInbound(c *gin.Context) {
+	inboundID, err := strconv.ParseInt(c.Param("inbound_id"), 10, 64)
+	if err != nil || inboundID <= 0 {
+		pkg.Error(c, http.StatusBadRequest, "入库单ID错误")
+		return
+	}
+
+	resp, err := service.ApproveStockInbound(c.Request.Context(), inboundID, c.GetInt64("userID"))
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidStockInbound), errors.Is(err, service.ErrStockInboundItemsEmpty):
+			pkg.Error(c, http.StatusBadRequest, err.Error())
+		case errors.Is(err, service.ErrStockInboundNotFound):
+			pkg.Error(c, http.StatusNotFound, err.Error())
+		case errors.Is(err, service.ErrStockInboundNotPending):
+			pkg.Error(c, http.StatusConflict, err.Error())
+		default:
+			pkg.Error(c, http.StatusInternalServerError, "入库申请审核失败")
+		}
+		return
+	}
+
+	pkg.Success(c, "入库申请审核通过，库存已增加", resp)
+}
+
+// RejectStockInbound 管理员拒绝采购入库申请，不改变库存。
+func RejectStockInbound(c *gin.Context) {
+	inboundID, err := strconv.ParseInt(c.Param("inbound_id"), 10, 64)
+	if err != nil || inboundID <= 0 {
+		pkg.Error(c, http.StatusBadRequest, "入库单ID错误")
+		return
+	}
+
+	var req model.RejectStockInboundRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		pkg.Error(c, http.StatusBadRequest, "参数错误")
+		return
+	}
+
+	resp, err := service.RejectStockInbound(c.Request.Context(), inboundID, c.GetInt64("userID"), &req)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidStockInbound):
+			pkg.Error(c, http.StatusBadRequest, err.Error())
+		case errors.Is(err, service.ErrStockInboundNotFound):
+			pkg.Error(c, http.StatusNotFound, err.Error())
+		case errors.Is(err, service.ErrStockInboundNotPending):
+			pkg.Error(c, http.StatusConflict, err.Error())
+		default:
+			pkg.Error(c, http.StatusInternalServerError, "入库申请拒绝失败")
+		}
+		return
+	}
+
+	pkg.Success(c, "入库申请已拒绝", resp)
+}
+
 // ListStockInbounds 查询全部入库申请列表。
 func ListStockInbounds(c *gin.Context) {
 	var status *int8 // // 接收可选的状态参数；nil表示前端未传status，需要查询全部状态
@@ -118,12 +280,12 @@ func ListStockInbounds(c *gin.Context) {
 		status = &stockInboundStatus             //取status指针,如果前端没传入任何值,就是nil 代表查询全部
 	}
 
-	page, ok := parsePositiveStockInboundQuery(c, "page")
+	page, ok := parsePositiveQuery(c, "page")
 	if !ok {
 		pkg.Error(c, http.StatusBadRequest, "页码错误")
 		return
 	}
-	pageSize, ok := parsePositiveStockInboundQuery(c, "page_size")
+	pageSize, ok := parsePositiveQuery(c, "page_size")
 	if !ok {
 		pkg.Error(c, http.StatusBadRequest, "每页数量错误")
 		return
@@ -172,8 +334,8 @@ func GetStockInboundDetail(c *gin.Context) {
 	pkg.Success(c, "入库申请详情查询成功", resp)
 }
 
-// parsePositiveStockInboundQuery 解析可选的正整数查询参数，未传时返回0。
-func parsePositiveStockInboundQuery(c *gin.Context, key string) (int, bool) {
+// parsePositiveQuery 解析可选的正整数查询参数，未传时返回0。
+func parsePositiveQuery(c *gin.Context, key string) (int, bool) {
 	value := c.Query(key)
 	if value == "" {
 		return 0, true

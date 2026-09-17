@@ -20,7 +20,6 @@ type StockInbound struct {
 	ReviewerID   *int64     `db:"reviewer_id"`   // 审核入库单的Admin ID，未审核时为空。
 	SubmittedAt  *time.Time `db:"submitted_at"`  // 运营提交审核的时间，草稿状态时为空。
 	ReviewedAt   *time.Time `db:"reviewed_at"`   // Admin完成审核的时间，未审核时为空。
-	InboundAt    *time.Time `db:"inbound_at"`    // 审核通过并实际增加库存的时间，未入库时为空。
 	Remark       *string    `db:"remark"`        // 运营填写的入库说明，可以为空。
 	ReviewRemark *string    `db:"review_remark"` // 审核说明或拒绝原因，可以为空。
 	CreatedAt    time.Time  `db:"created_at"`    // 入库单创建时间。
@@ -46,6 +45,37 @@ type SubmitStockInboundResponse struct {
 	InboundNo   string    `json:"inbound_no"`   // 入库单号。
 	Status      int8      `json:"status"`       // 状态：1待审核。
 	SubmittedAt time.Time `json:"submitted_at"` // 提交审核时间。
+}
+
+// CancelStockInboundResponse 取消整张入库单的结果。
+type CancelStockInboundResponse struct {
+	InboundID int64  `json:"inbound_id"` // 入库单ID。
+	InboundNo string `json:"inbound_no"` // 入库单号。
+	Status    int8   `json:"status"`     // 状态：4已取消。
+}
+
+// ApproveStockInboundResponse 管理员审核通过后的入库结果。
+type ApproveStockInboundResponse struct {
+	InboundID  int64     `json:"inbound_id"`  // 入库单ID。
+	InboundNo  string    `json:"inbound_no"`  // 入库单号。
+	Status     int8      `json:"status"`      // 状态：2已入库。
+	ReviewerID int64     `json:"reviewer_id"` // 审核人ID。
+	ReviewedAt time.Time `json:"reviewed_at"` // 审核时间。
+}
+
+// RejectStockInboundRequest 管理员拒绝入库申请的请求。
+type RejectStockInboundRequest struct {
+	ReviewRemark string `json:"review_remark" binding:"required,max=255"` // 拒绝原因。
+}
+
+// RejectStockInboundResponse 管理员拒绝入库申请的结果。
+type RejectStockInboundResponse struct {
+	InboundID    int64     `json:"inbound_id"`    // 入库单ID。
+	InboundNo    string    `json:"inbound_no"`    // 入库单号。
+	Status       int8      `json:"status"`        // 状态：3已拒绝。
+	ReviewerID   int64     `json:"reviewer_id"`   // 审核人ID。
+	ReviewedAt   time.Time `json:"reviewed_at"`   // 审核时间。
+	ReviewRemark string    `json:"review_remark"` // 拒绝原因。
 }
 
 // ListStockInboundsRequest 入库申请列表查询条件。
@@ -83,7 +113,6 @@ type StockInboundDetailResponse struct {
 	ReviewerID   *int64                           `json:"reviewer_id"`   // 审核人ID。
 	SubmittedAt  *time.Time                       `json:"submitted_at"`  // 提交审核时间。
 	ReviewedAt   *time.Time                       `json:"reviewed_at"`   // 完成审核时间。
-	InboundAt    *time.Time                       `json:"inbound_at"`    // 实际增加库存时间。
 	Remark       *string                          `json:"remark"`        // 入库说明。
 	ReviewRemark *string                          `json:"review_remark"` // 审核说明或拒绝原因。
 	CreatedAt    time.Time                        `json:"created_at"`    // 创建时间。

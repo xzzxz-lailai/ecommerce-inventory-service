@@ -29,6 +29,28 @@ type CreateStockInboundItemResponse struct {
 	CostPrice int64 `json:"cost_price"` // 单件采购成本，单位为分。
 }
 
+// UpdateStockInboundItemRequest 修改草稿SKU明细的数量和成本价。
+type UpdateStockInboundItemRequest struct {
+	Quantity  int    `json:"quantity" binding:"required,gt=0"`    // 新的入库数量。
+	CostPrice *int64 `json:"cost_price" binding:"required,gte=0"` // 新的单件成本；允许为0，但不能省略。
+}
+
+// UpdateStockInboundItemResponse 修改后的SKU明细。
+type UpdateStockInboundItemResponse struct {
+	ItemID    int64 `json:"item_id"`    // 入库明细ID。
+	InboundID int64 `json:"inbound_id"` // 所属入库单ID。
+	SKUID     int64 `json:"sku_id"`     // SKU ID，不在此接口修改。
+	Quantity  int   `json:"quantity"`   // 修改后的入库数量。
+	CostPrice int64 `json:"cost_price"` // 修改后的单件成本，单位为分。
+}
+
+// DeleteStockInboundItemResponse 删除草稿SKU明细的结果。
+type DeleteStockInboundItemResponse struct {
+	ItemID    int64 `json:"item_id"`    // 已删除的明细ID。
+	InboundID int64 `json:"inbound_id"` // 所属入库单ID。
+	SKUID     int64 `json:"sku_id"`     // 已删除明细的SKU ID。
+}
+
 // StockInboundDetailItemResponse 入库申请详情中的SKU明细。
 type StockInboundDetailItemResponse struct {
 	ItemID      int64   `json:"item_id"`      // 入库明细ID。

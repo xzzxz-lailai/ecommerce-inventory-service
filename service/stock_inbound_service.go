@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"inventory-service/global"
 	"inventory-service/httpclient"
@@ -17,15 +18,18 @@ import (
 )
 
 var (
-	ErrInvalidStockInbound       = errors.New("入库申请参数错误")
-	ErrStockInboundNotFound      = errors.New("入库单不存在")
-	ErrStockInboundForbidden     = errors.New("无权操作该入库单")
-	ErrStockInboundNotDraft      = errors.New("只有草稿状态的入库单可以添加明细")
-	ErrStockInboundItemsEmpty    = errors.New("入库单至少需要一条SKU明细")
-	ErrStockInboundItemDuplicate = errors.New("该入库单中已经存在此SKU")
-	ErrProductSKUNotFound        = errors.New("SKU不存在")
-	ErrProductNotFound           = errors.New("商品不存在")
-	ErrProductServiceUnavailable = errors.New("商品服务暂时不可用")
+	ErrInvalidStockInbound        = errors.New("入库申请参数错误")
+	ErrStockInboundNotFound       = errors.New("入库单不存在")
+	ErrStockInboundForbidden      = errors.New("无权操作该入库单")
+	ErrStockInboundNotDraft       = errors.New("只有草稿状态的入库单可以操作明细")
+	ErrStockInboundNotCancellable = errors.New("只有草稿或待审核的入库单可以取消")
+	ErrStockInboundNotPending     = errors.New("只有待审核的入库单可以审核")
+	ErrStockInboundItemsEmpty     = errors.New("入库单至少需要一条SKU明细")
+	ErrStockInboundItemNotFound   = errors.New("入库单SKU明细不存在")
+	ErrStockInboundItemDuplicate  = errors.New("该入库单中已经存在此SKU")
+	ErrProductSKUNotFound         = errors.New("SKU不存在")
+	ErrProductNotFound            = errors.New("商品不存在")
+	ErrProductServiceUnavailable  = errors.New("商品服务暂时不可用")
 )
 
 const (
@@ -146,6 +150,117 @@ func CreateStockInboundItem(ctx context.Context, inboundID int64, req *model.Cre
 	}, nil
 }
 
+// UpdateStockInboundItem 修改当前运营人员草稿入库单中的一条SKU明细。
+func UpdateStockInboundItem(ctx context.Context, inboundID int64, itemID int64, req *model.UpdateStockInboundItemRequest, operatorID int64) (*model.UpdateStockInboundItemResponse, bool, error) {
+	if inboundID <= 0 || itemID <= 0 || operatorID <= 0 || req == nil || req.CostPrice == nil {
+		return nil, false, fmt.Errorf("%w：入库单、明细或请求参数错误", ErrInvalidStockInbound)
+	}
+	if req.Quantity <= 0 || *req.CostPrice < 0 {
+		return nil, false, fmt.Errorf("%w：入库数量必须大于0，采购成本不能小于0", ErrInvalidStockInbound)
+	}
+
+	tx, err := global.DB.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback()
+
+	// 与提交审核使用同一张主表行锁，确保修改时仍处于草稿状态。
+	inbound, err := repo.GetStockInboundByIDForUpdate(ctx, tx, inboundID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, ErrStockInboundNotFound
+		}
+		return nil, false, err
+	}
+	if inbound.OperatorID != operatorID { // 创建这张入库单草稿的运营人员 ID，operatorID 是当前登录的运营人员 ID,必须一致
+		return nil, false, ErrStockInboundForbidden
+	}
+	if inbound.Status != model.StockInboundStatusDraft {
+		return nil, false, ErrStockInboundNotDraft
+	}
+
+	item, err := repo.GetStockInboundItemByIDForUpdate(ctx, tx, inboundID, itemID) // 在当前事务中明细表锁住这张入库单的这一条明细
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, ErrStockInboundItemNotFound
+		}
+		return nil, false, err
+	}
+
+	resp := &model.UpdateStockInboundItemResponse{
+		ItemID:    item.ItemID,
+		InboundID: item.InboundID,
+		SKUID:     item.SKUID,
+		Quantity:  req.Quantity,
+		CostPrice: *req.CostPrice,
+	}
+
+	// 新旧值相同，直接返回成功，并告知前端本次没有修改。
+	if item.Quantity == req.Quantity && item.CostPrice == *req.CostPrice {
+		if err := tx.Commit(); err != nil {
+			return nil, false, err
+		}
+		return resp, false, nil
+	}
+
+	if err := repo.UpdateStockInboundItem(ctx, tx, inboundID, itemID, req.Quantity, *req.CostPrice); err != nil {
+		return nil, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, err
+	}
+	return resp, true, nil
+}
+
+// DeleteStockInboundItem 删除当前运营人员草稿入库单中的一条SKU明细。
+func DeleteStockInboundItem(ctx context.Context, inboundID int64, itemID int64, operatorID int64) (*model.DeleteStockInboundItemResponse, error) {
+	if inboundID <= 0 || itemID <= 0 || operatorID <= 0 {
+		return nil, fmt.Errorf("%w：入库单ID、明细ID或运营人员ID错误", ErrInvalidStockInbound)
+	}
+
+	tx, err := global.DB.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// 锁定主表行，与修改明细和提交审核的状态检查保持一致。
+	inbound, err := repo.GetStockInboundByIDForUpdate(ctx, tx, inboundID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrStockInboundNotFound
+		}
+		return nil, err
+	}
+	if inbound.OperatorID != operatorID { //创建入库草稿的人和当前要执行的删除的人,必须一致
+		return nil, ErrStockInboundForbidden
+	}
+	if inbound.Status != model.StockInboundStatusDraft {
+		return nil, ErrStockInboundNotDraft
+	}
+
+	item, err := repo.GetStockInboundItemByIDForUpdate(ctx, tx, inboundID, itemID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrStockInboundItemNotFound
+		}
+		return nil, err
+	}
+	if err := repo.DeleteStockInboundItem(ctx, tx, inboundID, itemID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	return &model.DeleteStockInboundItemResponse{
+		ItemID:    item.ItemID,
+		InboundID: item.InboundID,
+		SKUID:     item.SKUID,
+	}, nil
+}
+
 // SubmitStockInbound 提交草稿入库单，等待管理员审核。
 func SubmitStockInbound(ctx context.Context, inboundID int64, operatorID int64) (*model.SubmitStockInboundResponse, error) {
 	// 1.校验入库单ID和运营人员ID。
@@ -205,6 +320,162 @@ func SubmitStockInbound(ctx context.Context, inboundID int64, operatorID int64) 
 		InboundNo:   inbound.InboundNo,
 		Status:      model.StockInboundStatusPending,
 		SubmittedAt: submittedAt,
+	}, nil
+}
+
+// CancelStockInbound 取消当前运营人员创建的草稿或待审核入库单。
+func CancelStockInbound(ctx context.Context, inboundID int64, operatorID int64) (*model.CancelStockInboundResponse, error) {
+	if inboundID <= 0 || operatorID <= 0 {
+		return nil, fmt.Errorf("%w：入库单ID或运营人员ID错误", ErrInvalidStockInbound)
+	}
+
+	tx, err := global.DB.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// 与管理员审核使用同一张主表行锁，避免取消和审核同时成功。
+	inbound, err := repo.GetStockInboundByIDForUpdate(ctx, tx, inboundID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrStockInboundNotFound
+		}
+		return nil, err
+	}
+	if inbound.OperatorID != operatorID { // 入库申请草稿单的人和要执行取消入库申请草稿单的人,必须一致
+		return nil, ErrStockInboundForbidden
+	}
+	// 如果当前状态不是草稿和待审核,就返回
+	if inbound.Status != model.StockInboundStatusDraft && inbound.Status != model.StockInboundStatusPending {
+		return nil, ErrStockInboundNotCancellable
+	}
+
+	if err := repo.CancelStockInbound(ctx, tx, inboundID, operatorID); err != nil {
+		if errors.Is(err, repo.ErrStockInboundNotEditable) {
+			return nil, ErrStockInboundNotCancellable
+		}
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	return &model.CancelStockInboundResponse{
+		InboundID: inbound.InboundID,
+		InboundNo: inbound.InboundNo,
+		Status:    model.StockInboundStatusCancelled,
+	}, nil
+}
+
+// ApproveStockInbound 审核通过整张入库单，并在同一事务中增加库存和记录流水。
+func ApproveStockInbound(ctx context.Context, inboundID int64, reviewerID int64) (*model.ApproveStockInboundResponse, error) {
+	if inboundID <= 0 || reviewerID <= 0 {
+		return nil, fmt.Errorf("%w：入库单ID或审核人ID错误", ErrInvalidStockInbound)
+	}
+
+	tx, err := global.DB.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// 锁定主表记录，防止并发请求重复审核同一张入库单。
+	inbound, err := repo.GetStockInboundByIDForUpdate(ctx, tx, inboundID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrStockInboundNotFound
+		}
+		return nil, err
+	}
+	if inbound.Status != model.StockInboundStatusPending {
+		return nil, ErrStockInboundNotPending
+	}
+
+	items, err := repo.ListStockInboundItemsTx(ctx, tx, inboundID)
+	if err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return nil, ErrStockInboundItemsEmpty
+	}
+
+	// 每条SKU明细分别增加可用库存，并写一条入库流水。
+	for _, item := range items {
+		if err := repo.IncreaseSKUAvailableStock(ctx, tx, item.SKUID, item.Quantity); err != nil {
+			return nil, err
+		}
+		if err := repo.CreateStockInboundLog(ctx, tx, inbound.InboundNo, item.SKUID, item.Quantity, reviewerID); err != nil {
+			return nil, err
+		}
+	}
+
+	reviewedAt := time.Now()
+	if err := repo.ApproveStockInbound(ctx, tx, inboundID, reviewerID, reviewedAt); err != nil {
+		if errors.Is(err, repo.ErrStockInboundNotEditable) {
+			return nil, ErrStockInboundNotPending
+		}
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	return &model.ApproveStockInboundResponse{
+		InboundID:  inbound.InboundID,
+		InboundNo:  inbound.InboundNo,
+		Status:     model.StockInboundStatusCompleted,
+		ReviewerID: reviewerID,
+		ReviewedAt: reviewedAt,
+	}, nil
+}
+
+// RejectStockInbound 拒绝待审核入库单，仅更新审核状态和原因。
+func RejectStockInbound(ctx context.Context, inboundID int64, reviewerID int64, req *model.RejectStockInboundRequest) (*model.RejectStockInboundResponse, error) {
+	if inboundID <= 0 || reviewerID <= 0 || req == nil {
+		return nil, fmt.Errorf("%w：入库单ID、审核人ID或请求参数错误", ErrInvalidStockInbound)
+	}
+	reviewRemark := strings.TrimSpace(req.ReviewRemark)
+	if reviewRemark == "" || utf8.RuneCountInString(reviewRemark) > 255 {
+		return nil, fmt.Errorf("%w：拒绝原因不能为空且不能超过255个字符", ErrInvalidStockInbound)
+	}
+
+	tx, err := global.DB.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// 锁定主表记录，防止与审核通过或重复拒绝并发处理。
+	inbound, err := repo.GetStockInboundByIDForUpdate(ctx, tx, inboundID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrStockInboundNotFound
+		}
+		return nil, err
+	}
+	if inbound.Status != model.StockInboundStatusPending {
+		return nil, ErrStockInboundNotPending
+	}
+
+	reviewedAt := time.Now()
+	if err := repo.RejectStockInbound(ctx, tx, inboundID, reviewerID, reviewedAt, reviewRemark); err != nil {
+		if errors.Is(err, repo.ErrStockInboundNotEditable) {
+			return nil, ErrStockInboundNotPending
+		}
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	return &model.RejectStockInboundResponse{
+		InboundID:    inbound.InboundID,
+		InboundNo:    inbound.InboundNo,
+		Status:       model.StockInboundStatusRejected,
+		ReviewerID:   reviewerID,
+		ReviewedAt:   reviewedAt,
+		ReviewRemark: reviewRemark,
 	}, nil
 }
 
@@ -313,7 +584,6 @@ func GetStockInboundDetail(ctx context.Context, inboundID int64, authorization s
 		ReviewerID:   inbound.ReviewerID,
 		SubmittedAt:  inbound.SubmittedAt,
 		ReviewedAt:   inbound.ReviewedAt,
-		InboundAt:    inbound.InboundAt,
 		Remark:       inbound.Remark,
 		ReviewRemark: inbound.ReviewRemark,
 		CreatedAt:    inbound.CreatedAt,
